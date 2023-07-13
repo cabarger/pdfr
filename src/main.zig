@@ -9,7 +9,7 @@ const AutoHashMap = std.AutoHashMap;
 /// PDF version example: %PDF-1.4
 const header_byte_count = 8;
 
-const ObjectLabel = struct {
+const IndirectObjectRefrence = struct {
     object_number: u32,
     generation_number: u32,
 };
@@ -17,6 +17,8 @@ const ObjectLabel = struct {
 const Object = union {
     name: []const u8,
     dict: AutoHashMap(u64, Object),
+    ior: IndirectObjectRefrence,
+    number: u32,
 };
 
 /// Handle those pesky CRs
@@ -72,41 +74,51 @@ pub fn main() !void {
         if (pdf_fbs.getWritten()[0] == '%') continue; // Ignore comments
 
         // Parse object label
-        {
-            var tok_obj_line = std.mem.splitSequence(u8, pdf_fbs.getWritten(), " ");
-            const obj_number = try fmt.parseUnsigned(u32, tok_obj_line.first(), 10);
-            const generation_number = try fmt.parseUnsigned(u32, tok_obj_line.next() orelse unreachable, 10);
-            pdf_fbs.reset();
+        var tok_obj_line = std.mem.splitSequence(u8, pdf_fbs.getWritten(), " ");
+        const obj_number = try fmt.parseUnsigned(u32, tok_obj_line.first(), 10);
+        _ = obj_number;
+        const generation_number = try fmt.parseUnsigned(u32, tok_obj_line.next() orelse unreachable, 10);
+        _ = generation_number;
 
-            assert(obj_number == 1);
-            assert(generation_number == 0);
-        }
-
-        // Now read object data
-        while (true) {
-            // TODO(caleb): Handle other obj types (for now assume dict)
-            try streamAppropriately(deal_with_crs, pdf_reader, pdf_writer);
-            var tok_obj_line = std.mem.splitSequence(u8, pdf_fbs.getWritten(), " ");
-            if (mem.eql(u8, tok_obj_line.first(), "<<")) { // dict
-                var obj = Object{ .dict = AutoHashMap(u64, Object).init(arena) };
-                while (true) {
-                    // tok_obj_line.peek() != null and !mem.eql(u8, tok_obj_line.peek().?, ">>") break
-                    const k = tok_obj_line.next() orelse unreachable;
-                    const v = tok_obj_line.next() orelse unreachable;
-                    try obj.dict.put(std.hash_map.hashString(k[1..]), Object{ .name = try arena.dupe(u8, v[1..]) });
-
-                    break; // TODO(Caleb): Handle values like "2 0 R"
+        // Now read object data. TODO(caleb): Handle other obj types (for now assume dict)
+        pdf_fbs.reset();
+        try streamAppropriately(deal_with_crs, pdf_reader, pdf_writer);
+        tok_obj_line = std.mem.splitSequence(u8, pdf_fbs.getWritten(), " ");
+        if (mem.eql(u8, tok_obj_line.first(), "<<")) { // dict
+            var obj = Object{ .dict = AutoHashMap(u64, Object).init(arena) };
+            while (true) {
+                defer {
+                    pdf_fbs.reset();
+                    streamAppropriately(deal_with_crs, pdf_reader, pdf_writer) catch unreachable;
+                    tok_obj_line = std.mem.splitSequence(u8, pdf_fbs.getWritten(), " ");
                 }
 
-                const type_value = obj.dict.getEntry(std.hash_map.hashString("Type")) orelse unreachable;
-                std.debug.print("{s}\n", .{type_value.value_ptr.*.name});
-                assert(mem.eql(u8, type_value.value_ptr.*.name, "Catalog"));
+                const k = if (tok_obj_line.index == 0) tok_obj_line.first() else tok_obj_line.next() orelse unreachable;
+                const v = tok_obj_line.next() orelse break; //HACK(caleb): Handles ">>" case.
 
-                unreachable; // :)
-            } else unreachable;
+                std.debug.print("-- {s}\n", .{k});
+                std.debug.print("-- {s}\n", .{v});
+
+                // Resolve value type
+                if (v[0] == '/') { // Name object
+                    try obj.dict.put(std.hash_map.hashString(k[1..]), Object{ .name = try arena.dupe(u8, v[1..]) });
+                } else if (pdf_fbs.getWritten()[try pdf_fbs.getPos() - 1] == 'R') { // Indirect refrence object
+                    var ior = IndirectObjectRefrence{
+                        .object_number = try fmt.parseUnsigned(u32, v, 10),
+                        .generation_number = try fmt.parseUnsigned(u32, tok_obj_line.next() orelse unreachable, 10),
+                    };
+                    try obj.dict.put(std.hash_map.hashString(k[1..]), Object{ .ior = ior });
+                } else if (v[0] == '[') { // List
+                    continue;
+                } else { // Number
+                    try obj.dict.put(std.hash_map.hashString(k[1..]), Object{ .number = try fmt.parseUnsigned(u32, v, 10) });
+                }
+            }
+
+            const type_entry = obj.dict.getEntry(std.hash_map.hashString("Type")) orelse unreachable;
+            std.debug.print("Type: {?}\n", .{type_entry.value_ptr.*});
         }
-
-        break;
+        assert(mem.eql(u8, pdf_fbs.getWritten(), "endobj")); // Last stream call should have read "endobj"
     }
 
     std.process.cleanExit();
