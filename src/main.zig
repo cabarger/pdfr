@@ -19,6 +19,14 @@ const Object = union {
     dict: AutoHashMap(u64, Object),
 };
 
+/// Handle those pesky CRs
+fn streamAppropriately(deal_with_crs: bool, reader: anytype, writer: anytype) !void {
+    if (deal_with_crs) {
+        try reader.streamUntilDelimiter(writer, '\r', null);
+        try reader.skipUntilDelimiterOrEof('\n');
+    } else try reader.streamUntilDelimiter(writer, '\r', null);
+}
+
 pub fn main() !void {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_instance.deinit();
@@ -30,18 +38,21 @@ pub fn main() !void {
     var buf: [1024]u8 = undefined;
     var pdf_fbs = std.io.fixedBufferStream(&buf);
     var pdf_writer = pdf_fbs.writer();
-
-    // TODO(caleb): Determine line delim. (for now assume \n) but \r\n is possible
-
     const pdf_reader = pdf_file.reader();
+
+    var deal_with_crs = false;
 
     // Parse version header
     {
         try pdf_reader.streamUntilDelimiter(pdf_writer, '\n', pdf_fbs.buffer.len);
         defer pdf_fbs.reset();
-        assert(pdf_fbs.getWritten().len >= header_byte_count);
+        assert(pdf_fbs.getWritten().len > header_byte_count);
+
+        // Figure out if lines end with '\r\n' or '\n'
+        if (pdf_fbs.getWritten()[try pdf_fbs.getPos() - 1] == '\r') deal_with_crs = true;
+
         assert(std.mem.eql(u8, pdf_fbs.getWritten()[0 .. header_byte_count - 1], "%PDF-1."));
-        const pdf_minor_version = try fmt.charToDigit(pdf_fbs.getWritten()[header_byte_count - 1], 10); //HACK(caleb): -1 is for \r
+        const pdf_minor_version = try fmt.charToDigit(pdf_fbs.getWritten()[header_byte_count - 1], 10);
 
         // NOTE(caleb): This dummy pdf text extractor only supports minor version 4
         assert(pdf_minor_version == 4);
@@ -50,13 +61,13 @@ pub fn main() !void {
     // TODO(caleb): Support non-textual PDF reading
     // Next determine if this is a textual or binary PDF file
     {
-        try pdf_reader.streamUntilDelimiter(pdf_writer, '\n', pdf_fbs.buffer.len);
+        try streamAppropriately(deal_with_crs, pdf_reader, pdf_writer);
         defer pdf_fbs.reset();
         assert(pdf_fbs.getWritten()[0] == '%'); // Line begins with a comment
         assert(pdf_fbs.getWritten()[1] < 128); // Textual if less than 128
     }
     while (true) {
-        try pdf_reader.streamUntilDelimiter(pdf_writer, '\n', pdf_fbs.buffer.len);
+        try streamAppropriately(deal_with_crs, pdf_reader, pdf_writer);
         defer pdf_fbs.reset();
         if (pdf_fbs.getWritten()[0] == '%') continue; // Ignore comments
 
@@ -74,8 +85,7 @@ pub fn main() !void {
         // Now read object data
         while (true) {
             // TODO(caleb): Handle other obj types (for now assume dict)
-            try pdf_reader.streamUntilDelimiter(pdf_writer, '\r', pdf_fbs.buffer.len);
-            try pdf_reader.skipUntilDelimiterOrEof('\n');
+            try streamAppropriately(deal_with_crs, pdf_reader, pdf_writer);
             var tok_obj_line = std.mem.splitSequence(u8, pdf_fbs.getWritten(), " ");
             if (mem.eql(u8, tok_obj_line.first(), "<<")) { // dict
                 var obj = Object{ .dict = AutoHashMap(u64, Object).init(arena) };
